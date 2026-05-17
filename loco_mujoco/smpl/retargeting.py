@@ -12,10 +12,12 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 import yaml
-from musclemimic_models import get_xml_path
 from omegaconf import DictConfig, OmegaConf
+from safetensors.torch import load_file
 from scipy.spatial.transform import Rotation as sRot
 from tqdm import tqdm
+
+from musclemimic_models import get_xml_path
 
 try:
     import joblib
@@ -23,7 +25,7 @@ try:
     from smplx.lbs import transform_mat
     from torch.autograd import Variable
 
-    from loco_mujoco.smpl import SMPLH_Parser
+    from loco_mujoco.smpl import SKEL_Parser, SMPLH_Parser
 
     _OPTIONAL_IMPORT_INSTALLED = True
 except ImportError as e:
@@ -49,6 +51,10 @@ try:
         get_robot_tpose_targets,
         get_smpl_tpose_indices,
         save_fitted_shape,
+    )
+    from general_motion_retargeting.utils.skel import (
+        get_skel_data,
+        load_skel_file,
     )
     from general_motion_retargeting.utils.smpl import (
         SMPLH_Parser as GMR_SMPLH_Parser,  # Renamed to avoid conflict with loco_mujoco.smpl.SMPLH_Parser
@@ -86,6 +92,8 @@ try:
 except ImportError:
     _GMR_INSTALLED = False
     _GMR_SHAPE_FITTING_INSTALLED = False
+
+from skel.kin_skel import skel_joints_name
 
 import loco_mujoco
 from loco_mujoco import PATH_TO_SMPL_ROBOT_CONF
@@ -261,6 +269,24 @@ def get_smpl_model_path():
 
     # 3. Use default
     default = str(_get_default_base_dir() / "smpl")
+    return default
+
+
+def get_skel_model_path():
+    """Get SMPL model path from env var, config, or default"""
+    # 1. Try environment variable (support both old and new names)
+    path = os.environ.get("SKEL_MODEL_PATH") or os.environ.get("MUSCLEMIMIC_SKEL_MODEL_PATH")
+    if path:
+        return path
+
+    # 2. Try config file (support both keys)
+    path_config = loco_mujoco.load_path_config()
+    path = path_config.get("SKEL_MODEL_PATH") or path_config.get("MUSCLEMIMIC_SKEL_MODEL_PATH")
+    if path:
+        return path
+
+    # 3. Use default
+    default = str(_get_default_base_dir() / "skel")
     return default
 
 
@@ -525,6 +551,194 @@ def fit_smpl_motion(
 
 
 # ============================================================================
+# SKEL addition # TODO: rewrite this and exclude shape fitting for now
+# ============================================================================
+
+
+def fit_skel_motion(
+    env_name: str,
+    robot_conf: DictConfig,
+    path_to_smpl_model: str,
+    motion_data: str | dict,
+    path_to_optimized_smpl_shape: str,
+    logger: logging.Logger,
+    skip_steps: bool = True,
+    visualize: bool = False,
+) -> tuple[Trajectory, dict]:
+    """Fit SMPL motion data to a robot configuration.
+
+    Args:
+        env_name (str): Name of the environment.
+        robot_conf (DictConfig): Configuration of the robot.
+        path_to_smpl_model (str): Path to the SMPL model.
+        motion_data (Dict): Dict containing the motion data to process.
+        path_to_optimized_smpl_shape (str): Path to the optimized SMPL shape file for the robot.
+        logger (logging.Logger): Logger for status updates.
+        visualize (bool): Whether to visualize the optimization process.
+
+    Returns:
+        tuple[Trajectory, dict]: The fitted motion trajectory and analysis data
+            containing pos_error, retarget_fps, and site_names.
+
+    """
+
+    if path_to_optimized_smpl_shape:
+        raise NotImplementedError(
+            "Shape optimization is not implemented yet, please provide a shape-matched SKEL sequence instead"
+        )
+
+    def get_xpos_and_xquat(smpl_positions, smpl_rot_mats, s2m_pos, s2m_rot_mat):
+        # get rotations of mimic sites
+        new_smpl_rot_mats = np.einsum("bij,bjk->bik", smpl_rot_mats, s2m_rot_mat)
+        new_smpl_quat = sRot.from_matrix(new_smpl_rot_mats).as_quat()
+        new_smpl_quat = quat_scalarlast2scalarfirst(new_smpl_quat)
+        pos_offset = np.einsum("bij,bj->bi", new_smpl_rot_mats, s2m_pos)
+        new_smpl_pos = torch.squeeze(smpl_positions - pos_offset)
+
+        return new_smpl_pos, new_smpl_quat
+
+    check_optional_imports()
+
+    # Normalize environment name for consistent retargeting
+    if "Mjx" in env_name:
+        env_name = env_name.replace("Mjx", "")
+
+    # get environment
+    env_cls = Mujoco.registered_envs[env_name]
+    env = env_cls(**robot_conf.env_params, th_params={"random_start": False, "fixed_start_conf": (0, 0)})
+
+    # add mocap bodies for all 'site_for_mimic' instances of an environment
+    mjspec = env.mjspec
+    sites_for_mimic = env.sites_for_mimic
+    site_ids = [mujoco.mj_name2id(env._model, mujoco.mjtObj.mjOBJ_SITE, s) for s in sites_for_mimic]
+    target_mocap_bodies = ["target_mocap_body_" + s for s in sites_for_mimic]
+    mjspec = add_mocap_bodies(mjspec, sites_for_mimic, target_mocap_bodies, robot_conf, add_equality_constraint=True)
+    env.reload_mujoco(mjspec)
+    key = jax.random.key(0)
+    env.reset(key)
+
+    smpl2mimic_site_idx = []
+    for s in sites_for_mimic:
+        # find smpl name
+        for site_name, conf in robot_conf.site_joint_matches.items():
+            if site_name == s:
+                smpl2mimic_site_idx.append(skel_joints_name.index(conf.smpl_joint))
+
+    smpl_parser_n = SKEL_Parser(model_path=path_to_smpl_model, gender=motion_data["gender"])
+    if path_to_optimized_smpl_shape is not None:
+        shape_new, scale, smpl2robot_pos, smpl2robot_rot_mat, offset_z, height_scale = joblib.load(
+            path_to_optimized_smpl_shape
+        )
+    else:
+        tmp_data = load_file(path_to_optimized_smpl_shape)
+        shape_new = torch.from_numpy(motion_data["shape"]).float()[[0]]
+        scale = tmp_data["scale"]
+        smpl2robot_pos = tmp_data["smpl2robot_pos"]
+        smpl2robot_rot_mat = tmp_data["smpl2robot_rot_mat"]
+        offset_z = tmp_data["offset_z"]
+        height_scale = tmp_data["height_scale"]
+
+    skip = robot_conf.optimization_params.skip_frames if skip_steps else 1
+    pose_q = torch.from_numpy(motion_data["pose"][::skip]).float()
+    len_traj = pose_q.shape[0]
+
+    total_z_offset = offset_z + robot_conf.optimization_params.z_offset_feet
+    trans = torch.from_numpy(motion_data["trans"][::skip]) + torch.tensor([0.0, 0.0, total_z_offset])
+
+    # apply height scaling while preserving init height
+    trans[:, :2] *= height_scale  # scale x and y
+    trans[:, 2] = (trans[:, 2] - trans[0, 2]) * height_scale + trans[0, 2]
+
+    with torch.no_grad():
+        transformations_matrices = smpl_parser_n.get_joint_transformations(
+            pose_q.reshape(len_traj, 46), shape_new.repeat(len_traj, 1), trans
+        )
+        global_pos = transformations_matrices[..., :3, 3]
+        global_rot_mats = transformations_matrices[..., :3, :3].detach().numpy()
+        root_pos = global_pos[:, 0:1]
+        global_pos = (global_pos - global_pos[:, 0:1]) * scale.detach() + root_pos
+
+    # calculate initial qpos from initial mocap pos
+    init_mocap_pos, init_mocap_quat = get_xpos_and_xquat(
+        global_pos[0, smpl2mimic_site_idx], global_rot_mats[0, smpl2mimic_site_idx], smpl2robot_pos, smpl2robot_rot_mat
+    )
+    qpos_init = get_init_qpos_for_motion_retargeting(env, init_mocap_pos, init_mocap_quat, robot_conf)
+    env._data.qpos = qpos_init
+
+    qpos = np.zeros((len_traj, env._model.nq))
+    num_matched = len(smpl2mimic_site_idx)
+
+    dist_array = np.zeros((len_traj, num_matched))
+    site_ids = [mujoco.mj_name2id(env._model, mujoco.mjtObj.mjOBJ_SITE, s) for s in sites_for_mimic]
+
+    # max_pen = 0
+    # TODO: currently with per frame offset, test will overall offset if needed for ground penetrations.
+    t_start = time.perf_counter()
+    for i in tqdm(range(len_traj)):
+        mocap_pos, mocap_quat = get_xpos_and_xquat(
+            global_pos[i, smpl2mimic_site_idx],
+            global_rot_mats[i, smpl2mimic_site_idx],
+            smpl2robot_pos,
+            smpl2robot_rot_mat,
+        )
+        env._data.mocap_pos = mocap_pos
+        env._data.mocap_quat = mocap_quat
+
+        mujoco.mj_step(env._model, env._data, robot_conf.optimization_params.motion_iterations)
+
+        qpos[i] = env._data.qpos.copy()
+        mujoco.mj_forward(env._model, env._data)
+        pen, _geom_id, _floor_id = max_penetration_with_floor(env._model, env._data)
+        if pen < 0:
+            qpos[i][2] -= pen
+
+        # TODO: test with overall ground penetration
+        # max_pen = min(max_pen, pen)
+
+        for k, site_id in enumerate(site_ids):
+            current_pos = env._data.site_xpos[site_id]  # real robot site position
+            target_pos = mocap_pos[k].cpu().numpy()  # target from SMPL
+            dist_array[i, k] = np.linalg.norm(current_pos - target_pos)
+
+        if visualize:
+            env.render()
+
+    t_total = time.perf_counter() - t_start
+    retarget_fps = float(len_traj / max(1e-12, t_total))
+
+    logger.info(f"[OK] SMPL retargeting complete: {len_traj} frames in {t_total:.2f}s ({retarget_fps:.2f} FPS)")
+
+    # TODO: test later for overall ground penetrations
+    # if max_pen < 0:
+    #    qpos[:, 2] -= max_pen
+
+    fps = motion_data["fps"] // skip
+
+    # Compute qvel from qpos using helper function
+    qpos, qvel = _compute_qvel_from_qpos(qpos, fps, env.root_free_joint_xml_name, env._model)
+
+    njnt = env._model.njnt
+    jnt_type = env._model.jnt_type
+    jnt_names = [mujoco.mj_id2name(env._model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(njnt)]
+
+    traj_info = TrajectoryInfo(
+        jnt_names,
+        model=TrajectoryModel(njnt, jnp.array(jnt_type)),
+        frequency=fps,
+    )
+
+    traj_data = TrajectoryData(jnp.array(qpos), jnp.array(qvel), split_points=jnp.array([0, len(qpos)]))
+
+    analysis = {
+        "pos_error": dist_array,
+        "retarget_fps": retarget_fps,
+        "site_names": sites_for_mimic,
+    }
+
+    return Trajectory(traj_info, traj_data), analysis
+
+
+# ============================================================================
 # GMR Fitted Shape Helpers
 # ============================================================================
 
@@ -665,6 +879,293 @@ def ensure_gmr_fitted_shape(
 
     logger.info(f"Saved fitted shape to: {fitted_path}")
     return fitted_path
+
+
+def fit_gmr_motion_skel(
+    env_name: str,
+    robot_conf: DictConfig,
+    motion_data: str,
+    logger: logging.Logger,
+    gmr_config: dict | None = None,
+) -> tuple[Trajectory, dict]:
+    """
+    Fit SMPL-H motion data to a robot using General Motion Retargeting (GMR).
+
+    An alternative to fit_smpl_motion() using GMR's IK-based retargeting.
+
+    Args:
+        env_name: Environment name
+        robot_conf: Robot configuration
+        motion_data: AMASS file path (str)
+        logger: Logger instance
+        gmr_config: GMR configuration dict (optional)
+            offset_to_ground: If True, finds lowest foot and offsets body to ground.
+
+    Returns:
+        tuple[Trajectory, dict]: Trajectory at GMR's native fps (~30Hz) and analysis data
+            containing pos_error and retarget_fps. Use extend_motion() to get 100Hz + full kinematics.
+
+    Note:
+        The GMR package's offset_human_data_to_ground method uses a hardcoded ground_offset.
+        For feet-on-ground behavior matching LocoMuJoCo, modify the installed package:
+        .venv/lib/.../general_motion_retargeting/motion_retarget.py line ~289:
+        Change: we find lowest body parts and reset the frame during ground_offset calculations
+    """
+    if not _GMR_INSTALLED:
+        raise ImportError(
+            "GMR (general_motion_retargeting) required. "
+            "Please use uv sync --extra gmr to install the extra dependencies."
+        )
+
+    if not isinstance(motion_data, str):
+        raise ValueError("GMR retargeting requires AMASS file path (str)")
+
+    # GMR configuration
+    gmr_config = gmr_config or {}
+    src_human = gmr_config.get("src_human", "skel")
+    target_fps = gmr_config.get("target_fps", 30)
+    solver = gmr_config.get("solver", "daqp")
+    damping = gmr_config.get("damping", 0.5)
+    offset_to_ground = gmr_config.get("offset_to_ground", True)
+    use_velocity_limit = gmr_config.get("use_velocity_limit", False)
+    verbose = gmr_config.get("verbose", False)
+    use_fitted_shape = gmr_config.get("use_fitted_shape", True)  # Default to True
+    shape_fitting_iterations = gmr_config.get("shape_fitting_iterations", 500)
+
+    # Map environment to GMR robot name
+    env_to_gmr_robot = {
+        "MyoFullBody": "myofullbody",
+        "MjxMyoFullBody": "myofullbody",
+    }
+    base_env_name = env_name.replace("Mjx", "") if "Mjx" in env_name else env_name
+    if base_env_name not in env_to_gmr_robot:
+        raise ValueError(f"GMR not configured for '{env_name}'. Supported: {list(env_to_gmr_robot.keys())}")
+    gmr_robot = env_to_gmr_robot[base_env_name]
+
+    # Get smpl model path
+    smpl_model_path = get_skel_model_path()
+    if not os.path.exists(smpl_model_path):
+        raise FileNotFoundError(
+            f"SKEL models not found at {smpl_model_path}\nPlease download SKEL models to this location."
+        )
+
+    # Setup robot-specific paths and fitted shape BEFORE loading SMPL-H
+    # (fitted_shape_path is used by load_smplh_file to apply fitted offsets)
+    myofullbody_env = None
+    fitted_shape_path = None
+
+    if gmr_robot == "myofullbody":
+        myofullbody_xml = get_xml_path("myofullbody")
+
+        if not myofullbody_xml.exists():
+            raise FileNotFoundError(f"MyoFullBody XML not found: {myofullbody_xml}")
+
+        # Local IK config path
+        myofullbody_ik_config = Path(__file__).parent / "gmr_configs" / "skel_to_myofullbody.json"
+        if not myofullbody_ik_config.exists():
+            raise FileNotFoundError(f"MyoFullBody IK config not found: {myofullbody_ik_config}")
+
+        # Inject into GMR's dictionaries
+        ROBOT_XML_DICT["myofullbody"] = myofullbody_xml
+        IK_CONFIG_DICT.setdefault("skel", {})["myofullbody"] = myofullbody_ik_config
+        ROBOT_BASE_DICT["myofullbody"] = "pelvis"
+        VIEWER_CAM_DISTANCE_DICT["myofullbody"] = 3.0
+
+        # Create MyoFullBody env to get model with fingers disabled
+        from musclemimic.environments.humanoids.myofullbody import MyoFullBody
+
+        myofullbody_env = MyoFullBody(**robot_conf.env_params)
+        logger.info(f"Created MyoFullBody env (nq={myofullbody_env._model.nq}, fingers disabled)")
+
+        # Auto-ensure fitted shape exists (if use_fitted_shape is enabled)
+        if use_fitted_shape:
+            fitted_shape_path = ensure_gmr_fitted_shape(
+                env_name=env_name,
+                gmr_robot=gmr_robot,
+                robot_xml_path=str(myofullbody_xml),
+                ik_config_path=str(myofullbody_ik_config),
+                smpl_model_path=smpl_model_path,
+                logger=logger,
+                iterations=shape_fitting_iterations,
+            )
+
+    logger.info(f"Loading SKEL motion from {motion_data}")
+    _, body_model, smplh_output, actual_human_height = load_skel_file(motion_data, smpl_model_path, (10, -5))
+
+    # Align FPS
+    logger.info(f"Aligning to {target_fps} fps...")
+    aligned_fps = target_fps
+    smplh_frames = get_skel_data(None, body_model, smplh_output)  # Assumes target fps == data fps
+    logger.info(f"Aligned: {aligned_fps:.2f} fps, {len(smplh_frames)} frames")
+
+    # Initialize GMR
+    logger.info(f"GMR init: robot={gmr_robot}, solver={solver}, use_fitted_shape={use_fitted_shape}")
+    retarget = GeneralMotionRetargeting(
+        actual_human_height=actual_human_height,
+        src_human=src_human,
+        tgt_robot=gmr_robot,
+        solver=solver,
+        damping=damping,
+        use_velocity_limit=use_velocity_limit,
+        verbose=verbose,
+        use_fitted_shape=use_fitted_shape,
+        fitted_shape_path=fitted_shape_path,
+    )
+
+    # Replace GMR's model with the finger-disabled version
+    if gmr_robot == "myofullbody" and myofullbody_env is not None:
+        import mink
+
+        logger.info(f"Replacing GMR model (nq: {retarget.model.nq} -> {myofullbody_env._model.nq})")
+        retarget.model = myofullbody_env._model
+        # Recreate configuration and data with new model
+        retarget.configuration = mink.Configuration(retarget.model)
+        # Rebuild dof/body/motor name dictionaries
+        retarget.robot_dof_names = {}
+        for i in range(retarget.model.nv):
+            dof_name = mujoco.mj_id2name(retarget.model, mujoco.mjtObj.mjOBJ_JOINT, retarget.model.dof_jntid[i])
+            retarget.robot_dof_names[dof_name] = i
+        retarget.robot_body_names = {}
+        for i in range(retarget.model.nbody):
+            body_name = mujoco.mj_id2name(retarget.model, mujoco.mjtObj.mjOBJ_BODY, i)
+            retarget.robot_body_names[body_name] = i
+        retarget.robot_motor_names = {}
+        for i in range(retarget.model.nu):
+            motor_name = mujoco.mj_id2name(retarget.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+            retarget.robot_motor_names[motor_name] = i
+        # Rebuild tasks and limits with new model
+        retarget.setup_retarget_configuration()
+        logger.info("Model replaced and GMR reconfigured")
+
+    # Add equality constraint tasks for myofullbody (enforces joint equalities)
+    if gmr_robot == "myofullbody":
+        model = retarget.configuration.model
+        eq_count = 0
+        # Use a configurable weight for equality constraint tasks; default is 5.0 if not specified in gmr_config
+        equality_constraint_weight = getattr(gmr_config, "equality_constraint_weight", 5.0)
+        for eq_id in range(model.neq):
+            if model.eq_type[eq_id] == mujoco.mjtEq.mjEQ_JOINT:
+                task = EqualityConstraintTask(model, eq_id)
+                # The weight controls the strength of the joint equality constraint in the optimization.
+                # Default is 5.0, which empirically balances constraint enforcement and optimization stability.
+                task.weight = equality_constraint_weight
+                retarget.tasks1.append(task)
+                retarget.tasks2.append(task)
+                eq_count += 1
+        if eq_count > 0:
+            logger.info(f"Added {eq_count} equality constraint tasks (weight={equality_constraint_weight})")
+
+        # Initialize limited joints with invalid qpos0 to their range midpoints
+        fixed_count = 0
+        qpos = retarget.configuration.data.qpos.copy()
+        for i in range(model.njnt):
+            if model.jnt_limited[i]:
+                qpos_adr = model.jnt_qposadr[i]
+                jnt_min, jnt_max = model.jnt_range[i]
+                if not (jnt_min <= qpos[qpos_adr] <= jnt_max):
+                    mid_val = (jnt_min + jnt_max) / 2
+                    qpos[qpos_adr] = mid_val
+                    fixed_count += 1
+        if fixed_count > 0:
+            logger.info(f"Initialized {fixed_count} joints to range midpoints")
+            # Update configuration with new qpos
+            retarget.configuration.update(q=qpos)
+
+    # Get environment for model structure
+    if myofullbody_env is not None:
+        # Reuse the MyoFullBody env we created earlier
+        env = myofullbody_env
+    elif env_name in ["MyoFullBody", "MjxMyoFullBody"]:
+        # MuscleMimic environments - import directly
+        if env_name == "MyoFullBody":
+            from musclemimic.environments.humanoids.myofullbody import MyoFullBody
+
+            env = MyoFullBody(**robot_conf.env_params, th_params={"random_start": False, "fixed_start_conf": (0, 0)})
+        else:  # MjxMyoFullBody
+            from musclemimic.environments.humanoids.myofullbody import MjxMyoFullBody
+
+            env = MjxMyoFullBody(**robot_conf.env_params, th_params={"random_start": False, "fixed_start_conf": (0, 0)})
+    else:
+        # LocoMuJoCo environments
+        env_cls = Mujoco.registered_envs[env_name]
+        env = env_cls(**robot_conf.env_params, th_params={"random_start": False, "fixed_start_conf": (0, 0)})
+
+    # Retarget frames
+    logger.info("Running GMR retargeting...")
+
+    qpos_list = []
+    dist_list = []
+    lowest_z_list = []
+
+    data = retarget.configuration.data
+
+    non_floor_geom_ids = [gid for gid in range(model.ngeom) if model.geom(gid).name != "floor"]
+    use_ids = non_floor_geom_ids if non_floor_geom_ids else list(range(model.ngeom))
+
+    t_start = time.perf_counter()
+
+    for i, frame in enumerate(smplh_frames):
+        if i % 30 == 0 and i > 0:
+            logger.info(f"  {i}/{len(smplh_frames)} frames")
+        qpos_frame, dist = retarget.retarget(frame, offset_to_ground=offset_to_ground)
+
+        data.qpos[:] = qpos_frame
+        mujoco.mj_forward(model, data)
+
+        lowest_z = float(np.min(data.geom_xpos[use_ids, 2]))
+
+        qpos_list.append(qpos_frame.copy())
+        dist_list.append(dist.copy())
+        lowest_z_list.append(lowest_z)
+
+    t_total = time.perf_counter() - t_start
+    retarget_fps = len(smplh_frames) / t_total if t_total > 0 else float("inf")
+
+    logger.info(
+        f"[OK] GMR retargeting complete: "
+        f"{len(smplh_frames)} frames in {t_total:.2f}s "
+        f"({retarget_fps:.2f} FPS, {1000 / retarget_fps:.2f} ms/frame)"
+    )
+
+    qpos = np.asarray(qpos_list)
+    dist_array = np.asarray(dist_list)
+
+    global_lowest_geom_z = float(min(lowest_z_list))
+
+    if global_lowest_geom_z > 0.0:
+        qpos[:, 2] -= global_lowest_geom_z
+
+    for i in range(len(qpos)):
+        data.qpos[:] = qpos[i]
+        mujoco.mj_forward(model, data)
+
+        pen, _geom_id, _floor_id = max_penetration_with_floor(model, data)
+
+        if pen < 0.0:
+            qpos[i, 2] -= pen
+
+    logger.info(f"Complete: {qpos.shape}")
+
+    # Compute velocities
+    qpos, qvel = _compute_qvel_from_qpos(qpos, aligned_fps, env.root_free_joint_xml_name, env._model)
+
+    # Build Trajectory (minimal - extend_motion adds xpos/xquat/sites)
+    njnt = env._model.njnt
+    jnt_names = [mujoco.mj_id2name(env._model, mujoco.mjtObj.mjOBJ_JOINT, i) for i in range(njnt)]
+    traj_info = TrajectoryInfo(
+        jnt_names,
+        model=TrajectoryModel(njnt, jnp.array(env._model.jnt_type)),
+        frequency=aligned_fps,
+    )
+
+    traj_data = TrajectoryData(jnp.array(qpos), jnp.array(qvel), split_points=jnp.array([0, len(qpos)]))
+
+    analysis = {
+        "pos_error": dist_array,
+        "retarget_fps": retarget_fps,
+    }
+
+    return Trajectory(traj_info, traj_data), analysis
 
 
 def fit_gmr_motion(
