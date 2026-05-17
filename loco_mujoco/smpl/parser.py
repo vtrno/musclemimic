@@ -2,16 +2,18 @@
 # Adhere to their licence to use this script
 
 import numpy as np
-from loco_mujoco.smpl import SMPL_BONE_ORDER_NAMES, SMPLH_BONE_ORDER_NAMES
+
+from loco_mujoco.smpl import SMPL_BONE_ORDER_NAMES, SMPLH_BONE_ORDER_NAMES, MANO_LEFT_BONE_ORDER_NAMES, MANO_RIGHT_BONE_ORDER_NAMES
 
 try:
     import torch
+    from skel.kin_skel import skel_joints_name
+    from skel.skel_model import SKEL as _SKEL
+    from smplx import MANO as _MANO
     from smplx import SMPL as _SMPL
     from smplx import SMPLH as _SMPLH
-
-    from smplx import MANO as _MANO
+    from smplx.lbs import batch_rigid_transform, batch_rodrigues, blend_shapes, transform_mat, vertices2joints
     from smplx.utils import match_dim
-    from smplx.lbs import blend_shapes, vertices2joints, batch_rodrigues, batch_rigid_transform, transform_mat
 
 except ImportError:
     # what can i do here?
@@ -19,6 +21,7 @@ except ImportError:
     _SMPLH = None
     _MANO = None
     torch = None
+    raise ImportError('Please install torch, smplx and skel')
 
 
 class SMPL_Parser(_SMPL):
@@ -496,6 +499,94 @@ class SMPLH_Parser(_SMPLH):
                 self.conaffinity,
             )
 
+class SKEL_Parser(_SKEL):
+    """
+    Simplified version of the parser, to use SKEL in gmr_plus
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.register_parameter('pose', torch.nn.Parameter(torch.zeros(1, 46)))
+        self.register_parameter('shape', torch.nn.Parameter(torch.zeros(1, 10)))
+        self.register_parameter('trans', torch.nn.Parameter(torch.zeros(1, 3)))
+
+        self.device = next(self.parameters()).device
+        self.joint_names = skel_joints_name
+        self.joint_axes = {x: np.identity(3) for x in self.joint_names}
+        self.joint_dofs = {x: ["z", "y", "x"] for x in self.joint_names}
+        self.joint_range = {x: np.hstack([np.ones([3, 1]) * -np.pi, np.ones([3, 1]) * np.pi]) for x in self.joint_names}
+
+
+        self.contype = {1: self.joint_names}
+        self.conaffinity = {1: self.joint_names}
+        self.zero_pose = torch.zeros(1, 46).float()
+
+    def forward(self, *args, **kwargs):
+        # Order is pose, shape, trans, skelmesh (defaults to false)
+        if len(args) > 0:
+            assert 'pose' not in kwargs, 'Pose is specified twice'
+            if len(args) == 1:
+                pose = args[0]
+                shape = self.shape
+                trans = self.trans
+            elif len(args) == 2:
+                assert 'betas' not in kwargs, 'Shape is specified twice'
+                pose = args[0]
+                shape = args[1]
+                trans = self.trans
+            elif len(args) == 3:
+                assert 'betas' not in kwargs, 'Shape is specified twice'
+                assert 'trans' not in kwargs, 'Trans is specified twice'
+                pose = args[0]
+                shape = args[1]
+                trans = args[2]
+
+        pose = kwargs.pop('pose', pose)
+        shape = kwargs.pop('betas', shape)
+        trans = kwargs.pop('trans', trans)
+
+        filtered_args = [
+            pose if pose is not None else self.pose,
+            shape if shape is not None else self.shape,
+            trans if trans is not None else self.trans
+            ]
+
+        skel_output = super().forward(*filtered_args, **kwargs)
+        return skel_output
+
+    def get_joints_verts(self, pose, th_betas=None, th_trans=None):
+        """
+        Pose should be batch_size x 46
+        """
+
+        if pose.shape[1] != 6:
+            pose = pose.reshape(-1, 46)
+        pose = pose.float()
+        if th_betas is not None:
+            th_betas = th_betas.float()
+
+        smpl_output = self.forward(
+            pose=pose,
+            betas=th_betas,
+            trans=th_trans,
+        )
+        vertices = smpl_output.skin_verts
+        joints = smpl_output.joints
+        return vertices, joints
+
+    def get_joint_transformations(self, pose, th_betas=None, th_trans=None):
+
+        if pose.shape[1] != 46:
+            pose = pose.reshape(-1, 46)
+        pose = pose.float()
+        if th_betas is not None:
+            th_betas = th_betas.float()
+        T = self(
+            pose,
+            betas=th_betas,
+            trans=th_trans,
+        )
+
+        return T.joints_ori
 
 class MANO_Parser(_MANO):
 
