@@ -49,8 +49,10 @@ try:
         compute_alignment_offsets,
         fit_smpl_shape_to_robot,
         get_robot_tpose_targets,
+        get_skel_tpose_rotation_matrix,
         get_smpl_tpose_indices,
         save_fitted_shape,
+        set_robot_to_tpose,
     )
     from general_motion_retargeting.utils.skel import (
         get_skel_data,
@@ -774,6 +776,270 @@ def get_gmr_fitted_shape_path(env_name: str, gmr_robot: str) -> str:
     return str(Path(fitted_dir) / f"{gmr_robot}_shape.pkl")
 
 
+def get_gmr_fitted_skel_shape_path(env_name: str, gmr_robot: str) -> str:
+    fitted_dir = get_gmr_fitted_shape_dir(env_name)
+    return str(Path(fitted_dir) / f"{gmr_robot}_skel_shape.pkl")
+
+
+def get_skel_robot_tpose_targets(robot_xml_path: str, robot_type: str, ik_config: dict):
+    model = mujoco.MjModel.from_xml_path(robot_xml_path)
+    data = mujoco.MjData(model)
+    set_robot_to_tpose(model, data, robot_type)
+
+    target_positions = []
+    target_rotations = []
+    skel_joint_names = []
+    human_joint_names = []
+    for robot_body_name, entry in ik_config["ik_match_table1"].items():
+        skel_joint_name = entry[0]
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, robot_body_name)
+        if body_id < 0:
+            raise ValueError(f"MyoFullBody body not found for SKEL fitting: {robot_body_name}")
+        if skel_joint_name not in skel_joints_name:
+            raise ValueError(f"SKEL joint not found for fitting: {skel_joint_name}")
+
+        target_positions.append(data.xpos[body_id].copy())
+        target_rotations.append(data.xmat[body_id].copy().reshape(3, 3))
+        skel_joint_names.append(skel_joint_name)
+        human_joint_names.append(skel_joint_name)
+
+    return (
+        np.asarray(target_positions),
+        skel_joint_names,
+        np.asarray(target_rotations),
+        human_joint_names,
+    )
+
+
+def get_skel_tpose_indices(joint_names: list[str]) -> np.ndarray:
+    return np.asarray([skel_joints_name.index(joint_name) for joint_name in joint_names], dtype=int)
+
+
+def get_skel_to_myofullbody_rotation() -> np.ndarray:
+    return get_skel_tpose_rotation_matrix("myofullbody")
+
+
+def fit_skel_shape_to_robot(
+    skel_parser,
+    target_positions: np.ndarray,
+    skel_joint_indices: np.ndarray,
+    target_rotations: np.ndarray,
+    iterations: int = 500,
+    lr: float = 1e-3,
+    device: str = "cpu",
+):
+    device = torch.device(device)
+    target_positions_t = torch.from_numpy(target_positions).float().to(device)
+    frame_rot = torch.from_numpy(get_skel_to_myofullbody_rotation()).float().to(device)
+
+    shape = Variable(torch.zeros([1, 10], device=device), requires_grad=True)
+    scale = Variable(torch.ones([1], device=device), requires_grad=True)
+    pose = torch.zeros([1, 46], device=device)
+    trans = torch.zeros([1, 3], device=device)
+
+    optimizer = torch.optim.Adam([shape, scale], lr=lr)
+    losses = []
+    init_feet_z = None
+    init_head_z = None
+
+    pbar = tqdm(range(iterations), desc="Fitting SKEL shape")
+    for iteration in pbar:
+        skel_output = skel_parser(pose, shape, trans)
+        joints = skel_output.joints
+        joints = torch.matmul(joints, frame_rot.T)
+
+        if init_feet_z is None:
+            foot_indices = [skel_joints_name.index(name) for name in ("calcn_l", "calcn_r", "toes_l", "toes_r")]
+            init_feet_z = torch.min(joints[0, foot_indices, 2]).detach().cpu().item()
+            init_head_z = joints[0, skel_joints_name.index("head"), 2].detach().cpu().item()
+
+        predicted_positions = joints[0, skel_joint_indices]
+        predicted_positions = (predicted_positions - predicted_positions[0:1]) * scale
+        target_positions_centered = target_positions_t - target_positions_t[0:1]
+
+        loss = (predicted_positions - target_positions_centered).pow(2).sum(dim=-1).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+
+        if iteration % 100 == 0:
+            pbar.set_description(f"Fitting SKEL shape - Loss: {loss.item():.6f}")
+
+    with torch.no_grad():
+        skel_output = skel_parser(pose, shape, trans)
+        joints = skel_output.joints
+        global_rot = skel_parser.get_joint_transformations(
+            pose,
+            th_betas=shape,
+            th_trans=trans,
+        )
+        joints = torch.matmul(joints, frame_rot.T)
+        global_rot = torch.matmul(frame_rot.view(1, 1, 3, 3), global_rot)
+
+        foot_indices = [skel_joints_name.index(name) for name in ("calcn_l", "calcn_r", "toes_l", "toes_r")]
+        final_feet_z = torch.min(joints[0, foot_indices, 2]).item()
+        final_head_z = joints[0, skel_joints_name.index("head"), 2].item()
+
+        root_pos = joints[:, 0:1, :]
+        joints = (joints - root_pos) * scale + root_pos
+
+        skel_pos = joints[0, skel_joint_indices].detach().cpu().numpy()
+        target_pos_np = np.asarray(target_positions)
+        skel2robot_pos = skel_pos - target_pos_np
+        root_delta = skel2robot_pos[0].copy()
+        skel2robot_pos = skel2robot_pos - root_delta
+
+        skel_rot = global_rot[0, skel_joint_indices].detach().cpu().numpy()
+        skel2robot_rot_mat = np.einsum("nij,njk->nik", skel_rot.transpose(0, 2, 1), target_rotations)
+
+        offset_z = float(init_feet_z - final_feet_z) if init_feet_z is not None else 0.0
+        height_scale = float((final_head_z - final_feet_z) / (init_head_z - init_feet_z)) if init_head_z is not None else 1.0
+
+    metrics = {
+        "final_loss": losses[-1],
+        "initial_loss": losses[0],
+        "losses": losses,
+        "converged": len(losses) > 1 and abs(losses[-2] - losses[-1]) < 1e-6,
+    }
+    return shape, scale, skel2robot_pos, skel2robot_rot_mat, offset_z, height_scale, metrics
+
+
+def compute_skel_alignment_offsets(
+    skel_parser,
+    shape: torch.Tensor,
+    scale: torch.Tensor,
+    skel_joint_indices: np.ndarray,
+    human_joint_names: list[str],
+    target_positions: np.ndarray,
+    target_rotations: np.ndarray,
+):
+    device = shape.device
+    pose = torch.zeros([1, 46], device=device)
+    trans = torch.zeros([1, 3], device=device)
+    frame_rot = torch.from_numpy(get_skel_to_myofullbody_rotation()).float().to(device)
+
+    with torch.no_grad():
+        skel_output = skel_parser(pose, shape, trans)
+        joints = skel_output.joints
+        global_rot = skel_parser.get_joint_transformations(pose, th_betas=shape, th_trans=trans)
+        joints = torch.matmul(joints, frame_rot.T)
+        global_rot = torch.matmul(frame_rot.view(1, 1, 3, 3), global_rot)
+
+    scale_value = float(scale.detach().view(-1)[0].cpu())
+    global_pos = joints.detach().cpu().numpy()[0]
+    root_pos = global_pos[0:1]
+    global_pos = (global_pos - root_pos) * scale_value + root_pos
+    global_rot = global_rot.detach().cpu().numpy()[0]
+
+    root_idx = human_joint_names.index("pelvis") if "pelvis" in human_joint_names else 0
+    skel_root = global_pos[skel_joint_indices[root_idx]]
+    robot_root = target_positions[root_idx]
+
+    pelvis_skel_rot = global_rot[skel_joint_indices[root_idx]]
+    pelvis_robot_rot = target_rotations[root_idx]
+    global_rot_offset_mat = pelvis_skel_rot.T @ pelvis_robot_rot
+
+    offsets = {
+        "pos_offsets": {},
+        "rot_offsets": {},
+        "global_rot_offset": sRot.from_matrix(global_rot_offset_mat).as_quat(scalar_first=True).tolist(),
+        "human_joint_names": human_joint_names,
+    }
+
+    for idx, human_name in enumerate(human_joint_names):
+        skel_idx = skel_joint_indices[idx]
+        skel_pos = global_pos[skel_idx]
+        skel_rot = global_rot[skel_idx]
+        robot_pos = target_positions[idx]
+        robot_rot = target_rotations[idx]
+
+        full_rot_offset_mat = skel_rot.T @ robot_rot
+        local_rot_offset_mat = global_rot_offset_mat.T @ full_rot_offset_mat
+        pos_offset_local = robot_rot.T @ ((robot_pos - robot_root) - (skel_pos - skel_root))
+
+        offsets["pos_offsets"][human_name] = [float(x) for x in pos_offset_local]
+        offsets["rot_offsets"][human_name] = sRot.from_matrix(local_rot_offset_mat).as_quat(scalar_first=True).tolist()
+
+    return offsets
+
+
+def ensure_gmr_fitted_skel_shape(
+    env_name: str,
+    gmr_robot: str,
+    robot_xml_path: str,
+    ik_config_path: str,
+    skel_model_path: str,
+    logger: logging.Logger,
+    iterations: int = 500,
+) -> str:
+    import json
+
+    fitted_path = get_gmr_fitted_skel_shape_path(env_name, gmr_robot)
+    metadata_path = fitted_path.replace("_shape.pkl", "_shape_metadata.json")
+
+    if os.path.exists(fitted_path) and os.path.exists(metadata_path):
+        logger.info(f"Found existing fitted SKEL shape: {fitted_path}")
+        return fitted_path
+
+    logger.info(f"Fitted SKEL shape not found for '{gmr_robot}', running shape fitting...")
+    with open(ik_config_path) as f:
+        ik_config = json.load(f)
+
+    robot_targets, skel_joint_names_for_fit, robot_rotations, human_joint_names = get_skel_robot_tpose_targets(
+        str(robot_xml_path),
+        gmr_robot,
+        ik_config,
+    )
+    skel_indices = get_skel_tpose_indices(skel_joint_names_for_fit)
+
+    from loco_mujoco.smpl.parser import SKEL_Parser
+
+    skel_parser = SKEL_Parser(model_path=skel_model_path, gender="male")
+    logger.info(f"Running SKEL shape fitting ({iterations} iterations)...")
+    (shape, scale, skel2robot_pos, skel2robot_rot_mat, offset_z, height_scale, metrics) = fit_skel_shape_to_robot(
+        skel_parser=skel_parser,
+        target_positions=robot_targets,
+        skel_joint_indices=skel_indices,
+        target_rotations=robot_rotations,
+        iterations=iterations,
+        lr=0.001,
+        device="cpu",
+    )
+
+    if not metrics["converged"]:
+        logger.warning(f"SKEL shape fitting did not converge (loss={float(metrics['final_loss']):.4f}m)")
+    else:
+        logger.info(f"SKEL shape fitting converged (loss={float(metrics['final_loss']):.4f}m, scale={float(scale):.4f})")
+
+    logger.info("Computing SKEL local frame offsets...")
+    local_offsets = compute_skel_alignment_offsets(
+        skel_parser=skel_parser,
+        shape=shape,
+        scale=scale,
+        skel_joint_indices=skel_indices,
+        human_joint_names=human_joint_names,
+        target_positions=robot_targets,
+        target_rotations=robot_rotations,
+    )
+
+    save_fitted_shape(
+        shape=shape,
+        scale=scale,
+        smpl2robot_pos=skel2robot_pos,
+        smpl2robot_rot_mat=skel2robot_rot_mat,
+        offset_z=offset_z,
+        height_scale=height_scale,
+        metrics=metrics,
+        save_path=fitted_path,
+        human_joint_names=human_joint_names,
+        local_offsets=local_offsets,
+    )
+
+    logger.info(f"Saved fitted SKEL shape to: {fitted_path}")
+    return fitted_path
+
+
 def ensure_gmr_fitted_shape(
     env_name: str,
     gmr_robot: str,
@@ -889,9 +1155,9 @@ def fit_gmr_motion_skel(
     gmr_config: dict | None = None,
 ) -> tuple[Trajectory, dict]:
     """
-    Fit SMPL-H motion data to a robot using General Motion Retargeting (GMR).
+    Fit SKEL motion data to a robot using General Motion Retargeting (GMR).
 
-    An alternative to fit_smpl_motion() using GMR's IK-based retargeting.
+    An alternative to fit_skel_motion() using GMR's IK-based retargeting.
 
     Args:
         env_name: Environment name
@@ -931,6 +1197,7 @@ def fit_gmr_motion_skel(
     verbose = gmr_config.get("verbose", False)
     use_fitted_shape = gmr_config.get("use_fitted_shape", True)  # Default to True
     shape_fitting_iterations = gmr_config.get("shape_fitting_iterations", 500)
+    root_orientation_offset = gmr_config.get("root_orientation_offset")
 
     # Map environment to GMR robot name
     env_to_gmr_robot = {
@@ -979,24 +1246,29 @@ def fit_gmr_motion_skel(
 
         # Auto-ensure fitted shape exists (if use_fitted_shape is enabled)
         if use_fitted_shape:
-            fitted_shape_path = ensure_gmr_fitted_shape(
+            fitted_shape_path = ensure_gmr_fitted_skel_shape(
                 env_name=env_name,
                 gmr_robot=gmr_robot,
                 robot_xml_path=str(myofullbody_xml),
                 ik_config_path=str(myofullbody_ik_config),
-                smpl_model_path=smpl_model_path,
+                skel_model_path=smpl_model_path,
                 logger=logger,
                 iterations=shape_fitting_iterations,
             )
 
     logger.info(f"Loading SKEL motion from {motion_data}")
-    _, body_model, smplh_output, actual_human_height = load_skel_file(motion_data, smpl_model_path, (10, -5))
+    _, body_model, smplh_output, actual_human_height = load_skel_file(
+        motion_data,
+        smpl_model_path,
+        (10, -5),
+        fitted_shape_path=fitted_shape_path,
+    )
 
     # Align FPS
     logger.info(f"Aligning to {target_fps} fps...")
     aligned_fps = target_fps
-    smplh_frames = get_skel_data(None, body_model, smplh_output)  # Assumes target fps == data fps
-    logger.info(f"Aligned: {aligned_fps:.2f} fps, {len(smplh_frames)} frames")
+    skel_frames = get_skel_data(None, body_model, smplh_output)  # Assumes target fps == data fps
+    logger.info(f"Aligned: {aligned_fps:.2f} fps, {len(skel_frames)} frames")
 
     # Initialize GMR
     logger.info(f"GMR init: robot={gmr_robot}, solver={solver}, use_fitted_shape={use_fitted_shape}")
@@ -1095,7 +1367,6 @@ def fit_gmr_motion_skel(
 
     qpos_list = []
     dist_list = []
-    lowest_z_list = []
 
     data = retarget.configuration.data
 
@@ -1104,31 +1375,39 @@ def fit_gmr_motion_skel(
 
     t_start = time.perf_counter()
 
-    for i, frame in enumerate(smplh_frames):
+    for i, frame in enumerate(skel_frames):
         if i % 30 == 0 and i > 0:
-            logger.info(f"  {i}/{len(smplh_frames)} frames")
+            logger.info(f"  {i}/{len(skel_frames)} frames")
         qpos_frame, dist = retarget.retarget(frame, offset_to_ground=offset_to_ground)
-
-        data.qpos[:] = qpos_frame
-        mujoco.mj_forward(model, data)
-
-        lowest_z = float(np.min(data.geom_xpos[use_ids, 2]))
 
         qpos_list.append(qpos_frame.copy())
         dist_list.append(dist.copy())
-        lowest_z_list.append(lowest_z)
 
     t_total = time.perf_counter() - t_start
-    retarget_fps = len(smplh_frames) / t_total if t_total > 0 else float("inf")
+    retarget_fps = len(skel_frames) / t_total if t_total > 0 else float("inf")
 
     logger.info(
         f"[OK] GMR retargeting complete: "
-        f"{len(smplh_frames)} frames in {t_total:.2f}s "
+        f"{len(skel_frames)} frames in {t_total:.2f}s "
         f"({retarget_fps:.2f} FPS, {1000 / retarget_fps:.2f} ms/frame)"
     )
 
     qpos = np.asarray(qpos_list)
     dist_array = np.asarray(dist_list)
+
+    if root_orientation_offset is not None:
+        root_offset = sRot.from_euler("xyz", root_orientation_offset, degrees=False)
+        root_pos0 = qpos[0, :3].copy()
+        qpos[:, :3] = root_pos0 + root_offset.apply(qpos[:, :3] - root_pos0)
+        root_rot = sRot.from_quat(qpos[:, 3:7], scalar_first=True)
+        qpos[:, 3:7] = (root_offset * root_rot).as_quat(scalar_first=True)
+        logger.info(f"Applied SKEL root pose offset: {root_orientation_offset}")
+
+    lowest_z_list = []
+    for qpos_frame in qpos:
+        data.qpos[:] = qpos_frame
+        mujoco.mj_forward(model, data)
+        lowest_z_list.append(float(np.min(data.geom_xpos[use_ids, 2])))
 
     global_lowest_geom_z = float(min(lowest_z_list))
 
