@@ -26,6 +26,16 @@ def set_smpl_model_path():
     _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_SMPL_MODEL_PATH", path_to_conf=loco_mujoco.get_variables_path())
 
 
+def set_skel_model_path():
+    """
+    Set the path to the SKEL model.
+    """
+    parser = argparse.ArgumentParser(description="Set the SKEL model path.")
+    parser.add_argument("--path", type=str, help="Path to the SKEL model.")
+    args = parser.parse_args()
+    _set_path_in_yaml_conf(args.path, "MUSCLEMIMIC_SKEL_MODEL_PATH", path_to_conf=loco_mujoco.get_variables_path())
+
+
 def set_all_caches():
     """
     Set the path to which all converted datasets will be stored. This sets the following Variables:

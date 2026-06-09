@@ -234,6 +234,32 @@ uv run musclemimic-set-all-caches --path /path/to/converted_datasets
 These commands write user-specific settings to `~/.musclemimic/MUSCLEMIMIC_VARIABLES.yaml` by default.
 Set `MUSCLEMIMIC_CONFIG_PATH` if you want to use a different config file.
 
+#### Optional: Configure SKEL Models
+SKEL retargeting requires the SKEL model files from the [SKEL download page](https://skel.is.tue.mpg.de/download). Place them in a directory containing:
+
+```bash
+/path/to/skel/
+├── skel_female.pkl
+└── skel_male.pkl
+```
+
+Set the path once:
+
+```bash
+uv run musclemimic-set-skel-model-path --path /path/to/skel
+```
+
+After converting an AMASS sequence to SKEL with `SKEL/examples/align_to_SMPL_seq.py`, you can retarget without passing `SKEL_MODEL_PATH` every time:
+
+```bash
+uv run python demo_gmr_plus_skel.py \
+  --skel-file /path/to/sequence_skel.pkl \
+  --output sequence_myofullbody.npz \
+  --source-fps 100 \
+  --record \
+  --video-name sequence_skel
+```
+
 #### 4. Convert SMPL-H and MANO to SMPLH_neutral.pkl
 Run the conversion script to generate the `SMPLH_neutral.pkl` file needed for retargeting:
 

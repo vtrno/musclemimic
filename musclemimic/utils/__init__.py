@@ -17,6 +17,7 @@ from loco_mujoco.utils import (
     set_converted_amass_path,
     set_converted_lafan1_path,
     set_lafan1_path,
+    set_skel_model_path,
     set_smpl_model_path,
 )
 
@@ -39,6 +40,7 @@ __all__ = [
     "set_converted_amass_path",
     "set_converted_lafan1_path",
     "set_lafan1_path",
+    "set_skel_model_path",
     "set_smpl_model_path",
     "setup_headless_rendering",
     "setup_headless_rendering_if_needed",

@@ -6,6 +6,7 @@ __version__ = "0.1.0"
 __all__ = [
     "set_amass_path",
     "set_smpl_model_path",
+    "set_skel_model_path",
     "set_converted_amass_path",
     "set_lafan1_path",
     "set_converted_lafan1_path",
@@ -18,6 +19,7 @@ def __getattr__(name):
         from .utils import (
             set_amass_path,
             set_smpl_model_path,
+            set_skel_model_path,
             set_converted_amass_path,
             set_lafan1_path,
             set_converted_lafan1_path,

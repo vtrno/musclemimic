@@ -82,6 +82,7 @@ cuda = [
 smpl = [
     "torch",
     "smplx @ git+https://github.com/amathislab/smplx",
+    "psbody-mesh",
     "joblib",
 ]
 
@@ -94,6 +95,7 @@ gmr = [
 
 # Dataset path configuration
 musclemimic-set-smpl-model-path = "musclemimic.utils:set_smpl_model_path"
+musclemimic-set-skel-model-path = "musclemimic.utils:set_skel_model_path"
 musclemimic-set-amass-path = "musclemimic.utils:set_amass_path"
 musclemimic-set-conv-amass-path = "musclemimic.utils:set_converted_amass_path"
 musclemimic-set-lafan1-path = "musclemimic.utils:set_lafan1_path"
@@ -124,6 +126,7 @@ explicit = true
 [tool.uv.sources]
 general-motion-retargeting = { git = "https://github.com/vtrno/gmr_plus.git", branch = "dev/cheryl" }
 skel = { git = "https://github.com/cherylwang20/SKEL.git" }
+psbody-mesh = { git = "https://github.com/MarilynKeller/mesh" }
 torch = { index = "pytorch-cpu" }
 
 [tool.setuptools.packages.find]

@@ -121,6 +121,20 @@ OPTIMIZED_SHAPE_FILE_NAME = "shape_optimized.pkl"
 BIMANUAL_ENV_NAME = "MyoBimanualArm"
 
 
+def _resolve_skel_aligned_fps(gmr_config: dict | None) -> float:
+    """Resolve SKEL motion timing from config.
+
+    SKEL files generated from AMASS currently do not carry FPS metadata, so
+    callers can pass source_fps to preserve the original mocap timing.
+    """
+    gmr_config = gmr_config or {}
+    fps = gmr_config.get("source_fps", gmr_config.get("target_fps", 30))
+    fps = float(fps)
+    if fps <= 0:
+        raise ValueError(f"source_fps/target_fps must be positive, got {fps}")
+    return fps
+
+
 def _compute_qvel_from_qpos(qpos: np.ndarray, fps: float, free_joint_name: str, model: mujoco.MjModel) -> np.ndarray:
     """
     Compute joint velocities from positions using MuJoCo's mj_differentiatePos.
@@ -1190,6 +1204,7 @@ def fit_gmr_motion_skel(
     gmr_config = gmr_config or {}
     src_human = gmr_config.get("src_human", "skel")
     target_fps = gmr_config.get("target_fps", 30)
+    source_fps = _resolve_skel_aligned_fps(gmr_config)
     solver = gmr_config.get("solver", "daqp")
     damping = gmr_config.get("damping", 0.5)
     offset_to_ground = gmr_config.get("offset_to_ground", True)
@@ -1265,8 +1280,8 @@ def fit_gmr_motion_skel(
     )
 
     # Align FPS
-    logger.info(f"Aligning to {target_fps} fps...")
-    aligned_fps = target_fps
+    logger.info(f"Using SKEL source fps: {source_fps:g} (target_fps={target_fps})")
+    aligned_fps = source_fps
     skel_frames = get_skel_data(None, body_model, smplh_output)  # Assumes target fps == data fps
     logger.info(f"Aligned: {aligned_fps:.2f} fps, {len(skel_frames)} frames")
 

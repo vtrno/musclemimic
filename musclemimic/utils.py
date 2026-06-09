@@ -3,6 +3,7 @@
 from loco_mujoco.utils import (
     set_amass_path,
     set_smpl_model_path,
+    set_skel_model_path,
     set_converted_amass_path,
     set_lafan1_path,
     set_converted_lafan1_path,
@@ -12,6 +13,7 @@ from loco_mujoco.utils import (
 __all__ = [
     "set_amass_path",
     "set_smpl_model_path",
+    "set_skel_model_path",
     "set_converted_amass_path",
     "set_lafan1_path",
     "set_converted_lafan1_path",
