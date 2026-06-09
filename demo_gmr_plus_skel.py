@@ -16,6 +16,7 @@ def parse_arguments():
         description="SKEL to MyoFullBody retargeting and visualization demo",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--skel-file", type=str, default="demo_json.json", help="Input SKEL motion file")
     parser.add_argument("--output", default="demo_json.npz", help="Output retargeted trajectory")
     parser.add_argument("--record", action="store_true", default=False, help="Record video of trajectory playback")
     parser.add_argument("--output-dir", type=str, default="./retargeting_recordings", help="Output directory for videos")
@@ -56,7 +57,7 @@ def main():
     trajectory, results = fit_gmr_motion_skel(
         'MyoFullBody',
         robot_conf,
-        'demo_json.json',
+        args.skel_file,
         logger,
         skel_config,
     )
